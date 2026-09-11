@@ -21,7 +21,7 @@ SIGNING_CERT_HASH="$(
 )"
 if [[ -z "$SIGNING_CERT_HASH" ]]; then
     echo "Missing stable code-signing identity: $SIGNING_IDENTITY" >&2
-    echo "Set MAGIC_TAP_CLICK_SIGNING_IDENTITY to an installed Apple Development or Developer ID identity." >&2
+    echo "Run $ROOT_DIR/setup-signing.sh once, or set MAGIC_TAP_CLICK_SIGNING_IDENTITY to another installed identity." >&2
     exit 1
 fi
 SIGNING_REQUIREMENT="designated => identifier \"$BUNDLE_IDENTIFIER\" and certificate root = H\"$SIGNING_CERT_HASH\""

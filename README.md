@@ -34,9 +34,12 @@
 
 ```sh
 cd /Users/jinoisfree/Documents/ChatGPT/btt
+./setup-signing.sh
 ./build.sh
 /Users/jinoisfree/Applications/MagicTapClick.app/Contents/MacOS/MagicTapClick --self-test
 ```
+
+`setup-signing.sh`는 최초 한 번만 실행합니다. 로그인 키체인에 10년 유효기간의 로컬 코드서명 인증서와 개인 키를 저장하며, 이미 동일한 유효 인증서가 있으면 아무것도 변경하지 않습니다. 개인 키는 Git 저장소에 기록되지 않습니다. 기존 인증서를 잃어 새 인증서를 생성한 경우에만 macOS 권한을 한 번 다시 등록해야 합니다.
 
 빌드 결과는 프로젝트의 `build` 폴더에 생성되고, 실행용 앱은 파일 제공자 메타데이터의 영향을 받지 않도록 `/Users/jinoisfree/Applications/MagicTapClick.app`에 설치됩니다.
 
