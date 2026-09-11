@@ -840,7 +840,6 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
     if (type == kCGEventMouseMoved ||
         type == kCGEventLeftMouseDragged ||
         type == kCGEventRightMouseDragged) {
-        [detector filterMagicMouseMotionEvent:event];
         [detector handleMouseMoved:event];
     } else if ([detector shouldSuppressPhysicalEventType:type]) {
         return NULL;
@@ -854,7 +853,6 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
     self = [super init];
     if (self) {
         _bridge = [MagicTouchBridge new];
-        _motionGate = [MagicMouseMotionGate new];
         _initialPositions = [NSMutableDictionary dictionary];
         _doubleClickInterval = [NSEvent doubleClickInterval];
         _enabled = YES;
@@ -877,11 +875,8 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
         _rightClickMode = ValidClickActivationMode(rightMode);
 
         NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        NSNumber *savedPrecisionEnabled =
-            [defaults objectForKey:kPointerPrecisionEnabledDefaultsKey];
-        _pointerPrecisionEnabled = savedPrecisionEnabled != nil
-            ? savedPrecisionEnabled.boolValue
-            : NO;
+        _pointerPrecisionEnabled = NO;
+        [defaults setBool:NO forKey:kPointerPrecisionEnabledDefaultsKey];
         NSNumber *savedFineGain =
             [defaults objectForKey:kPointerFineGainDefaultsKey];
         NSNumber *savedMediumGain =
@@ -919,11 +914,7 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
     if (!bridgeStarted) {
         return NO;
     }
-    BOOL motionGateStarted = [_motionGate start];
-    NSLog(@"MagicTapClick: pointer precision device gate=%@",
-          motionGateStarted ? @"running" : @"unavailable");
     if (![self startMouseMotionMonitor]) {
-        [_motionGate stop];
         [_bridge stop];
         return NO;
     }
@@ -933,7 +924,6 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
 - (void)stop {
     [self endDrag];
     [self stopMouseMotionMonitor];
-    [_motionGate stop];
     [_bridge stop];
     [self resetTracking];
     [self clearTapHistory];
@@ -1009,47 +999,7 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
 }
 
 - (void)filterMagicMouseMotionEvent:(CGEventRef)event {
-    if (!_enabled || !_pointerPrecisionEnabled || event == NULL) {
-        return;
-    }
-
-    int64_t deltaX = CGEventGetIntegerValueField(event,
-                                                  kCGMouseEventDeltaX);
-    int64_t deltaY = CGEventGetIntegerValueField(event,
-                                                  kCGMouseEventDeltaY);
-    if (deltaX == 0 && deltaY == 0) {
-        return;
-    }
-
-    double rawSpeed = 0.0;
-    BOOL matched = [_motionGate consumeMotionMatchingDeltaX:deltaX
-                                                  deltaY:deltaY
-                                            rawSpeedOut:&rawSpeed];
-    if (!matched) {
-        return;
-    }
-
-    double gain = PointerGainForRawSpeed(rawSpeed,
-                                         _pointerFineGain,
-                                         _pointerMediumGain,
-                                         _pointerFastGain);
-    double exactX = (double)deltaX * gain + _pointerResidualX;
-    double exactY = (double)deltaY * gain + _pointerResidualY;
-    int64_t adjustedX = (int64_t)trunc(exactX);
-    int64_t adjustedY = (int64_t)trunc(exactY);
-    _pointerResidualX = exactX - (double)adjustedX;
-    _pointerResidualY = exactY - (double)adjustedY;
-
-    CGPoint position = CGEventGetLocation(event);
-    position.x += (CGFloat)(adjustedX - deltaX);
-    position.y += (CGFloat)(adjustedY - deltaY);
-    CGEventSetLocation(event, position);
-    CGEventSetIntegerValueField(event,
-                                kCGMouseEventDeltaX,
-                                adjustedX);
-    CGEventSetIntegerValueField(event,
-                                kCGMouseEventDeltaY,
-                                adjustedY);
+    (void)event;
 }
 
 - (void)setEnabled:(BOOL)enabled {
@@ -1085,11 +1035,12 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
 }
 
 - (void)setPointerPrecisionEnabled:(BOOL)pointerPrecisionEnabled {
-    _pointerPrecisionEnabled = pointerPrecisionEnabled;
+    (void)pointerPrecisionEnabled;
+    _pointerPrecisionEnabled = NO;
     _pointerResidualX = 0.0;
     _pointerResidualY = 0.0;
     [[NSUserDefaults standardUserDefaults]
-        setBool:pointerPrecisionEnabled
+        setBool:NO
           forKey:kPointerPrecisionEnabledDefaultsKey];
 }
 
@@ -1775,22 +1726,12 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
     sensitivityItem.submenu = sensitivityMenu;
     [menu addItem:sensitivityItem];
 
-    NSMenuItem *pointerPrecisionToggle = [[NSMenuItem alloc]
-        initWithTitle:@"포인터 정밀도 켜기"
-        action:@selector(togglePointerPrecision:)
+    NSMenuItem *pointerSafetyItem = [[NSMenuItem alloc]
+        initWithTitle:@"포인터 정밀도: 안전 모드로 비활성화"
+        action:nil
         keyEquivalent:@""];
-    pointerPrecisionToggle.target = self;
-    pointerPrecisionToggle.state = _detector.pointerPrecisionEnabled
-        ? NSControlStateValueOn
-        : NSControlStateValueOff;
-    [menu addItem:pointerPrecisionToggle];
-
-    NSMenuItem *pointerSettingsItem = [[NSMenuItem alloc]
-        initWithTitle:@"포인터 정밀도 설정…"
-        action:@selector(showPointerSettings:)
-        keyEquivalent:@""];
-    pointerSettingsItem.target = self;
-    [menu addItem:pointerSettingsItem];
+    pointerSafetyItem.enabled = NO;
+    [menu addItem:pointerSafetyItem];
 
     BOOL accessibilityGranted = AXIsProcessTrusted();
     BOOL postEventGranted = PostEventAccessIsGranted();
@@ -2209,6 +2150,11 @@ static int RunSelfTest(void) {
            fineResult,
            mediumResult,
            fastResult);
+    TapDetector *pointerSafetyDetector = [TapDetector new];
+    pointerSafetyDetector.pointerPrecisionEnabled = YES;
+    BOOL pointerSafetyOK = !pointerSafetyDetector.pointerPrecisionEnabled;
+    printf("unsafe pointer rewrite blocked: %s\n",
+           pointerSafetyOK ? "OK" : "FAIL");
     printf("caller-context accessibility: %s\n",
            AXIsProcessTrusted() ? "granted" : "not granted");
     printf("caller-context post event access: %s\n",
@@ -2228,7 +2174,8 @@ static int RunSelfTest(void) {
         CFRelease(eventTap);
     }
     dlclose(framework);
-    return clickModeMatrixOK && pointerCurveOK && eventTap != NULL ? 0 : 1;
+    return clickModeMatrixOK && pointerCurveOK && pointerSafetyOK &&
+           eventTap != NULL ? 0 : 1;
 }
 
 int main(int argc, const char *argv[]) {
