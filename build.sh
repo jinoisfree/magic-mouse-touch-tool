@@ -79,6 +79,20 @@ for attempt in {1..20}; do
 done
 codesign --verify --deep --strict "$APP_DIR"
 
+if /usr/bin/pgrep -x MagicTapClick >/dev/null 2>&1; then
+    /usr/bin/pkill -TERM -x MagicTapClick
+    for attempt in {1..20}; do
+        if ! /usr/bin/pgrep -x MagicTapClick >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    if /usr/bin/pgrep -x MagicTapClick >/dev/null 2>&1; then
+        echo "MagicTapClick did not stop cleanly; update aborted." >&2
+        exit 1
+    fi
+fi
+
 mkdir -p "$(dirname "$INSTALL_APP_DIR")"
 /usr/bin/ditto --norsrc "$APP_DIR" "$INSTALL_APP_DIR"
 xattr -cr "$INSTALL_APP_DIR"

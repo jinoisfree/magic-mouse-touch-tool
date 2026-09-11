@@ -2,14 +2,39 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOKit/IOKitLib.h>
+#import <IOKit/hid/IOHIDManager.h>
+#import <IOKit/hid/IOHIDUsageTables.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
+#import <fcntl.h>
 #import <math.h>
 #import <stdbool.h>
 #import <stdio.h>
 #import <string.h>
+#import <sys/file.h>
 #import <unistd.h>
+
+static int gSingleInstanceLockFD = -1;
+
+static BOOL AcquireSingleInstanceLock(void) {
+    NSString *lockPath = [NSString stringWithFormat:
+        @"/private/tmp/com.jino.magic-tap-click.%u.lock",
+        getuid()];
+    int lockFD = open(lockPath.fileSystemRepresentation,
+                      O_CREAT | O_RDWR,
+                      0600);
+    if (lockFD < 0) {
+        NSLog(@"MagicTapClick: single-instance lock open failed");
+        return NO;
+    }
+    if (flock(lockFD, LOCK_EX | LOCK_NB) != 0) {
+        close(lockFD);
+        return NO;
+    }
+    gSingleInstanceLockFD = lockFD;
+    return YES;
+}
 
 // Magic Mouse touch frames are exposed only through this private framework.
 // The declarations below match the ABI used by current macOS releases.
@@ -76,6 +101,7 @@ typedef io_service_t (*MTDeviceGetServiceFunction)(MTDeviceRef);
 // Current Apple drivers identify Magic Mouse devices with family ID 112 and
 // product IDs 617 or 803. Require both so every trackpad fails closed.
 static const uint32_t kMagicMouseFamilyID = 112;
+static const uint32_t kAppleBluetoothVendorID = 76;
 static const uint32_t kMagicMouseProductIDLightning = 617;
 static const uint32_t kMagicMouseProductIDUSBC = 803;
 
@@ -426,9 +452,56 @@ static NSString *const kLeftClickModeDefaultsKey =
     @"MagicTapClick.LeftClickMode";
 static NSString *const kRightClickModeDefaultsKey =
     @"MagicTapClick.RightClickMode";
+static NSString *const kPointerPrecisionEnabledDefaultsKey =
+    @"MagicTapClick.PointerPrecisionEnabled";
+static NSString *const kPointerFineGainDefaultsKey =
+    @"MagicTapClick.PointerFineGain";
+static NSString *const kPointerMediumGainDefaultsKey =
+    @"MagicTapClick.PointerMediumGain";
+static NSString *const kPointerFastGainDefaultsKey =
+    @"MagicTapClick.PointerFastGain";
 static const float kRightSideTouchBoundary = 0.42f;
 static const NSTimeInterval kPhysicalClickCorrelationWindow = 0.10;
+static const NSTimeInterval kMagicMouseMotionCorrelationWindow = 0.050;
 static const int64_t kSyntheticEventMarker = 0x4D54434C49434B;
+
+static const double kDefaultPointerFineGain = 0.50;
+static const double kDefaultPointerMediumGain = 0.80;
+static const double kDefaultPointerFastGain = 1.00;
+
+static double ClampFinePointerGain(double gain) {
+    return fmax(0.0, fmin(1.0, gain));
+}
+
+static double ClampPointerGain(double gain) {
+    return fmax(0.25, fmin(1.50, gain));
+}
+
+static double SmoothStep(double value) {
+    double t = fmax(0.0, fmin(1.0, value));
+    return t * t * (3.0 - 2.0 * t);
+}
+
+static double PointerGainForRawSpeed(double rawSpeed,
+                                     double fineGain,
+                                     double mediumGain,
+                                     double fastGain) {
+    fineGain = ClampFinePointerGain(fineGain);
+    mediumGain = ClampPointerGain(mediumGain);
+    fastGain = ClampPointerGain(fastGain);
+    if (rawSpeed <= 8.0) {
+        return fineGain;
+    }
+    if (rawSpeed <= 32.0) {
+        double t = SmoothStep((rawSpeed - 8.0) / 24.0);
+        return fineGain + (mediumGain - fineGain) * t;
+    }
+    if (rawSpeed <= 96.0) {
+        double t = SmoothStep((rawSpeed - 32.0) / 64.0);
+        return mediumGain + (fastGain - mediumGain) * t;
+    }
+    return fastGain;
+}
 
 static TapSensitivityProfile TapSensitivityProfileForLevel(TouchSensitivity level) {
     switch (level) {
@@ -502,6 +575,184 @@ static BOOL TouchesHaveThreeFingers(const MTTouch *touches, size_t count) {
     return count == 3;
 }
 
+@class MagicMouseMotionGate;
+
+static void magicMouseHIDValueCallback(void *context,
+                                       IOReturn result,
+                                       void *sender,
+                                       IOHIDValueRef value);
+
+@interface MagicMouseMotionGate : NSObject
+- (BOOL)start;
+- (void)stop;
+- (BOOL)consumeMotionMatchingDeltaX:(int64_t)deltaX
+                             deltaY:(int64_t)deltaY
+                       rawSpeedOut:(double *)rawSpeedOut;
+@end
+
+@interface MagicMouseMotionGate () {
+    IOHIDManagerRef _manager;
+    NSTimeInterval _lastMotionTime;
+    int64_t _pendingRawX;
+    int64_t _pendingRawY;
+}
+- (void)handleValue:(IOHIDValueRef)value;
+@end
+
+static void magicMouseHIDValueCallback(void *context,
+                                       IOReturn result,
+                                       void *sender,
+                                       IOHIDValueRef value) {
+    (void)sender;
+    if (result != kIOReturnSuccess || value == NULL) {
+        return;
+    }
+    MagicMouseMotionGate *gate = (__bridge MagicMouseMotionGate *)context;
+    [gate handleValue:value];
+}
+
+@implementation MagicMouseMotionGate
+
+- (BOOL)start {
+    if (_manager != NULL) {
+        return YES;
+    }
+
+    _manager = IOHIDManagerCreate(kCFAllocatorDefault,
+                                  kIOHIDOptionsTypeNone);
+    if (_manager == NULL) {
+        return NO;
+    }
+
+    NSArray *productIDs = @[@(kMagicMouseProductIDLightning),
+                            @(kMagicMouseProductIDUSBC)];
+    NSMutableArray *matches = [NSMutableArray array];
+    for (NSNumber *productID in productIDs) {
+        [matches addObject:@{
+            @kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop),
+            @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_Mouse),
+            @kIOHIDVendorIDKey: @(kAppleBluetoothVendorID),
+            @kIOHIDProductIDKey: productID
+        }];
+    }
+    IOHIDManagerSetDeviceMatchingMultiple(
+        _manager,
+        (__bridge CFArrayRef)matches);
+    IOHIDManagerRegisterInputValueCallback(_manager,
+                                            magicMouseHIDValueCallback,
+                                            (__bridge void *)self);
+    IOHIDManagerScheduleWithRunLoop(_manager,
+                                    CFRunLoopGetMain(),
+                                    kCFRunLoopCommonModes);
+    IOReturn openResult = IOHIDManagerOpen(_manager,
+                                           kIOHIDOptionsTypeNone);
+    if (openResult != kIOReturnSuccess) {
+        [self stop];
+        NSLog(@"MagicTapClick: Magic Mouse HID motion gate open failed: 0x%x",
+              openResult);
+        return NO;
+    }
+
+    CFSetRef devices = IOHIDManagerCopyDevices(_manager);
+    CFIndex count = devices != NULL ? CFSetGetCount(devices) : 0;
+    if (devices != NULL) {
+        CFRelease(devices);
+    }
+    if (count == 0) {
+        [self stop];
+        NSLog(@"MagicTapClick: Magic Mouse HID motion gate found no device");
+        return NO;
+    }
+
+    NSLog(@"MagicTapClick: Magic Mouse HID motion gate started devices=%ld",
+          (long)count);
+    return YES;
+}
+
+- (void)stop {
+    if (_manager == NULL) {
+        return;
+    }
+    IOHIDManagerUnscheduleFromRunLoop(_manager,
+                                      CFRunLoopGetMain(),
+                                      kCFRunLoopCommonModes);
+    IOHIDManagerClose(_manager, kIOHIDOptionsTypeNone);
+    CFRelease(_manager);
+    _manager = NULL;
+    @synchronized (self) {
+        _lastMotionTime = 0.0;
+        _pendingRawX = 0;
+        _pendingRawY = 0;
+    }
+}
+
+- (void)handleValue:(IOHIDValueRef)value {
+    IOHIDElementRef element = IOHIDValueGetElement(value);
+    if (element == NULL ||
+        IOHIDElementGetUsagePage(element) != kHIDPage_GenericDesktop ||
+        !IOHIDElementIsRelative(element)) {
+        return;
+    }
+
+    uint32_t usage = IOHIDElementGetUsage(element);
+    if (usage != kHIDUsage_GD_X && usage != kHIDUsage_GD_Y) {
+        return;
+    }
+    CFIndex rawValue = IOHIDValueGetIntegerValue(value);
+    if (rawValue == 0) {
+        return;
+    }
+
+    @synchronized (self) {
+        NSTimeInterval now = CACurrentMediaTime();
+        if (_lastMotionTime == 0.0 ||
+            (now - _lastMotionTime) > kMagicMouseMotionCorrelationWindow) {
+            _pendingRawX = 0;
+            _pendingRawY = 0;
+        }
+        if (usage == kHIDUsage_GD_X) {
+            _pendingRawX = rawValue;
+        } else {
+            _pendingRawY = rawValue;
+        }
+        _lastMotionTime = now;
+    }
+}
+
+- (BOOL)consumeMotionMatchingDeltaX:(int64_t)deltaX
+                             deltaY:(int64_t)deltaY
+                       rawSpeedOut:(double *)rawSpeedOut {
+    @synchronized (self) {
+        NSTimeInterval now = CACurrentMediaTime();
+        if (_lastMotionTime == 0.0 ||
+            now < _lastMotionTime ||
+            (now - _lastMotionTime) > kMagicMouseMotionCorrelationWindow) {
+            return NO;
+        }
+
+        int64_t rawX = _pendingRawX;
+        int64_t rawY = _pendingRawY;
+        BOOL xMatches = rawX == 0 || deltaX == 0 ||
+                        ((rawX > 0) == (deltaX > 0));
+        BOOL yMatches = rawY == 0 || deltaY == 0 ||
+                        ((rawY > 0) == (deltaY > 0));
+        if ((rawX == 0 && rawY == 0) || !xMatches || !yMatches) {
+            return NO;
+        }
+
+        if (rawSpeedOut != NULL) {
+            *rawSpeedOut = hypot((double)rawX, (double)rawY);
+        }
+        return YES;
+    }
+}
+
+- (void)dealloc {
+    [self stop];
+}
+
+@end
+
 @interface ClickInjector : NSObject
 + (void)postClickOnRightSide:(BOOL)rightSide clickCount:(NSInteger)clickCount;
 + (void)postLeftMouseDown;
@@ -515,12 +766,17 @@ static BOOL TouchesHaveThreeFingers(const MTTouch *touches, size_t count) {
 @property(nonatomic, assign) TouchSensitivity sensitivity;
 @property(nonatomic, assign) ClickActivationMode leftClickMode;
 @property(nonatomic, assign) ClickActivationMode rightClickMode;
+@property(nonatomic, assign) BOOL pointerPrecisionEnabled;
+@property(nonatomic, assign) double pointerFineGain;
+@property(nonatomic, assign) double pointerMediumGain;
+@property(nonatomic, assign) double pointerFastGain;
 - (BOOL)start;
 - (void)stop;
 @end
 
 @interface TapDetector () {
     MagicTouchBridge *_bridge;
+    MagicMouseMotionGate *_motionGate;
     BOOL _tracking;
     BOOL _moved;
     BOOL _dragCandidate;
@@ -538,6 +794,8 @@ static BOOL TouchesHaveThreeFingers(const MTTouch *touches, size_t count) {
     BOOL _hasLastTap;
     NSTimeInterval _lastMagicMouseButtonDownTime;
     NSTimeInterval _lastMagicMouseButtonUpTime;
+    double _pointerResidualX;
+    double _pointerResidualY;
 }
 - (void)handleFrame:(const MTTouch *)touches
               count:(size_t)count
@@ -551,6 +809,7 @@ static BOOL TouchesHaveThreeFingers(const MTTouch *touches, size_t count) {
 - (void)stopMouseMotionMonitor;
 - (void)reenableMouseEventTap;
 - (void)handleMouseMoved:(CGEventRef)event;
+- (void)filterMagicMouseMotionEvent:(CGEventRef)event;
 - (void)handleMagicMouseButtonState:(uint32_t)newState
                            oldState:(uint32_t)oldState;
 - (BOOL)shouldSuppressPhysicalEventType:(CGEventType)type;
@@ -578,7 +837,10 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
         kSyntheticEventMarker) {
         return event;
     }
-    if (type == kCGEventMouseMoved) {
+    if (type == kCGEventMouseMoved ||
+        type == kCGEventLeftMouseDragged ||
+        type == kCGEventRightMouseDragged) {
+        [detector filterMagicMouseMotionEvent:event];
         [detector handleMouseMoved:event];
     } else if ([detector shouldSuppressPhysicalEventType:type]) {
         return NULL;
@@ -592,6 +854,7 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
     self = [super init];
     if (self) {
         _bridge = [MagicTouchBridge new];
+        _motionGate = [MagicMouseMotionGate new];
         _initialPositions = [NSMutableDictionary dictionary];
         _doubleClickInterval = [NSEvent doubleClickInterval];
         _enabled = YES;
@@ -612,6 +875,28 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
             integerForKey:kRightClickModeDefaultsKey];
         _leftClickMode = ValidClickActivationMode(leftMode);
         _rightClickMode = ValidClickActivationMode(rightMode);
+
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSNumber *savedPrecisionEnabled =
+            [defaults objectForKey:kPointerPrecisionEnabledDefaultsKey];
+        _pointerPrecisionEnabled = savedPrecisionEnabled != nil
+            ? savedPrecisionEnabled.boolValue
+            : NO;
+        NSNumber *savedFineGain =
+            [defaults objectForKey:kPointerFineGainDefaultsKey];
+        NSNumber *savedMediumGain =
+            [defaults objectForKey:kPointerMediumGainDefaultsKey];
+        NSNumber *savedFastGain =
+            [defaults objectForKey:kPointerFastGainDefaultsKey];
+        _pointerFineGain = ClampFinePointerGain(savedFineGain != nil
+            ? savedFineGain.doubleValue
+            : kDefaultPointerFineGain);
+        _pointerMediumGain = ClampPointerGain(savedMediumGain != nil
+            ? savedMediumGain.doubleValue
+            : kDefaultPointerMediumGain);
+        _pointerFastGain = ClampPointerGain(savedFastGain != nil
+            ? savedFastGain.doubleValue
+            : kDefaultPointerFastGain);
     }
     return self;
 }
@@ -634,7 +919,11 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
     if (!bridgeStarted) {
         return NO;
     }
+    BOOL motionGateStarted = [_motionGate start];
+    NSLog(@"MagicTapClick: pointer precision device gate=%@",
+          motionGateStarted ? @"running" : @"unavailable");
     if (![self startMouseMotionMonitor]) {
+        [_motionGate stop];
         [_bridge stop];
         return NO;
     }
@@ -644,6 +933,7 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
 - (void)stop {
     [self endDrag];
     [self stopMouseMotionMonitor];
+    [_motionGate stop];
     [_bridge stop];
     [self resetTracking];
     [self clearTapHistory];
@@ -655,6 +945,8 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
     }
 
     CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved) |
+                       CGEventMaskBit(kCGEventLeftMouseDragged) |
+                       CGEventMaskBit(kCGEventRightMouseDragged) |
                        CGEventMaskBit(kCGEventLeftMouseDown) |
                        CGEventMaskBit(kCGEventLeftMouseUp) |
                        CGEventMaskBit(kCGEventRightMouseDown) |
@@ -716,6 +1008,50 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
     [self activateDragAt:position];
 }
 
+- (void)filterMagicMouseMotionEvent:(CGEventRef)event {
+    if (!_enabled || !_pointerPrecisionEnabled || event == NULL) {
+        return;
+    }
+
+    int64_t deltaX = CGEventGetIntegerValueField(event,
+                                                  kCGMouseEventDeltaX);
+    int64_t deltaY = CGEventGetIntegerValueField(event,
+                                                  kCGMouseEventDeltaY);
+    if (deltaX == 0 && deltaY == 0) {
+        return;
+    }
+
+    double rawSpeed = 0.0;
+    BOOL matched = [_motionGate consumeMotionMatchingDeltaX:deltaX
+                                                  deltaY:deltaY
+                                            rawSpeedOut:&rawSpeed];
+    if (!matched) {
+        return;
+    }
+
+    double gain = PointerGainForRawSpeed(rawSpeed,
+                                         _pointerFineGain,
+                                         _pointerMediumGain,
+                                         _pointerFastGain);
+    double exactX = (double)deltaX * gain + _pointerResidualX;
+    double exactY = (double)deltaY * gain + _pointerResidualY;
+    int64_t adjustedX = (int64_t)trunc(exactX);
+    int64_t adjustedY = (int64_t)trunc(exactY);
+    _pointerResidualX = exactX - (double)adjustedX;
+    _pointerResidualY = exactY - (double)adjustedY;
+
+    CGPoint position = CGEventGetLocation(event);
+    position.x += (CGFloat)(adjustedX - deltaX);
+    position.y += (CGFloat)(adjustedY - deltaY);
+    CGEventSetLocation(event, position);
+    CGEventSetIntegerValueField(event,
+                                kCGMouseEventDeltaX,
+                                adjustedX);
+    CGEventSetIntegerValueField(event,
+                                kCGMouseEventDeltaY,
+                                adjustedY);
+}
+
 - (void)setEnabled:(BOOL)enabled {
     _enabled = enabled;
     if (!enabled) {
@@ -746,6 +1082,42 @@ static CGEventRef magicMouseMotionCallback(CGEventTapProxy proxy,
     [[NSUserDefaults standardUserDefaults]
         setInteger:_rightClickMode forKey:kRightClickModeDefaultsKey];
     [self clearTapHistory];
+}
+
+- (void)setPointerPrecisionEnabled:(BOOL)pointerPrecisionEnabled {
+    _pointerPrecisionEnabled = pointerPrecisionEnabled;
+    _pointerResidualX = 0.0;
+    _pointerResidualY = 0.0;
+    [[NSUserDefaults standardUserDefaults]
+        setBool:pointerPrecisionEnabled
+          forKey:kPointerPrecisionEnabledDefaultsKey];
+}
+
+- (void)setPointerFineGain:(double)pointerFineGain {
+    _pointerFineGain = ClampFinePointerGain(pointerFineGain);
+    _pointerResidualX = 0.0;
+    _pointerResidualY = 0.0;
+    [[NSUserDefaults standardUserDefaults]
+        setDouble:_pointerFineGain
+           forKey:kPointerFineGainDefaultsKey];
+}
+
+- (void)setPointerMediumGain:(double)pointerMediumGain {
+    _pointerMediumGain = ClampPointerGain(pointerMediumGain);
+    _pointerResidualX = 0.0;
+    _pointerResidualY = 0.0;
+    [[NSUserDefaults standardUserDefaults]
+        setDouble:_pointerMediumGain
+           forKey:kPointerMediumGainDefaultsKey];
+}
+
+- (void)setPointerFastGain:(double)pointerFastGain {
+    _pointerFastGain = ClampPointerGain(pointerFastGain);
+    _pointerResidualX = 0.0;
+    _pointerResidualY = 0.0;
+    [[NSUserDefaults standardUserDefaults]
+        setDouble:_pointerFastGain
+           forKey:kPointerFastGainDefaultsKey];
 }
 
 - (BOOL)isTouchClickEnabledOnRightSide:(BOOL)rightSide {
@@ -1163,11 +1535,28 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
     BOOL _engineRunning;
     NSTimeInterval _nextEngineRetryTime;
     NSString *_lastRuntimeFingerprint;
+    NSWindow *_pointerSettingsWindow;
+    NSButton *_pointerPrecisionCheckbox;
+    NSSlider *_pointerFineSlider;
+    NSSlider *_pointerMediumSlider;
+    NSSlider *_pointerFastSlider;
+    NSTextField *_pointerFineValueLabel;
+    NSTextField *_pointerMediumValueLabel;
+    NSTextField *_pointerFastValueLabel;
 }
 - (void)toggleEnabled:(id)sender;
 - (void)setSensitivity:(id)sender;
 - (void)setLeftClickMode:(id)sender;
 - (void)setRightClickMode:(id)sender;
+- (void)togglePointerPrecision:(id)sender;
+- (void)showPointerSettings:(id)sender;
+- (void)updatePointerPrecisionEnabled:(id)sender;
+- (void)updatePointerGain:(id)sender;
+- (void)resetPointerGains:(id)sender;
+- (void)refreshPointerSettingsControls;
+- (NSStackView *)pointerSliderRowWithTitle:(NSString *)title
+                                    slider:(NSSlider *)slider
+                                valueLabel:(NSTextField *)valueLabel;
 - (void)openAccessibilitySettings:(id)sender;
 - (void)quit:(id)sender;
 - (void)refreshMenu;
@@ -1386,6 +1775,23 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
     sensitivityItem.submenu = sensitivityMenu;
     [menu addItem:sensitivityItem];
 
+    NSMenuItem *pointerPrecisionToggle = [[NSMenuItem alloc]
+        initWithTitle:@"포인터 정밀도 켜기"
+        action:@selector(togglePointerPrecision:)
+        keyEquivalent:@""];
+    pointerPrecisionToggle.target = self;
+    pointerPrecisionToggle.state = _detector.pointerPrecisionEnabled
+        ? NSControlStateValueOn
+        : NSControlStateValueOff;
+    [menu addItem:pointerPrecisionToggle];
+
+    NSMenuItem *pointerSettingsItem = [[NSMenuItem alloc]
+        initWithTitle:@"포인터 정밀도 설정…"
+        action:@selector(showPointerSettings:)
+        keyEquivalent:@""];
+    pointerSettingsItem.target = self;
+    [menu addItem:pointerSettingsItem];
+
     BOOL accessibilityGranted = AXIsProcessTrusted();
     BOOL postEventGranted = PostEventAccessIsGranted();
     BOOL inputMonitoringGranted = InputMonitoringIsGranted();
@@ -1466,6 +1872,184 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
     [self refreshMenu];
 }
 
+- (void)togglePointerPrecision:(id)sender {
+    (void)sender;
+    _detector.pointerPrecisionEnabled = !_detector.pointerPrecisionEnabled;
+    [self refreshPointerSettingsControls];
+    [self refreshMenu];
+}
+
+- (NSStackView *)pointerSliderRowWithTitle:(NSString *)title
+                                    slider:(NSSlider *)slider
+                                valueLabel:(NSTextField *)valueLabel {
+    NSTextField *titleLabel = [NSTextField labelWithString:title];
+    titleLabel.alignment = NSTextAlignmentLeft;
+    [titleLabel.widthAnchor constraintEqualToConstant:92.0].active = YES;
+    valueLabel.alignment = NSTextAlignmentRight;
+    valueLabel.font = [NSFont monospacedDigitSystemFontOfSize:12.0
+                                                       weight:NSFontWeightRegular];
+    [valueLabel.widthAnchor constraintEqualToConstant:52.0].active = YES;
+
+    NSStackView *row = [NSStackView stackViewWithViews:@[
+        titleLabel,
+        slider,
+        valueLabel
+    ]];
+    row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    row.alignment = NSLayoutAttributeCenterY;
+    row.spacing = 10.0;
+    return row;
+}
+
+- (void)showPointerSettings:(id)sender {
+    (void)sender;
+    if (_pointerSettingsWindow == nil) {
+        NSRect frame = NSMakeRect(0.0, 0.0, 480.0, 310.0);
+        _pointerSettingsWindow = [[NSWindow alloc]
+            initWithContentRect:frame
+                      styleMask:NSWindowStyleMaskTitled |
+                                NSWindowStyleMaskClosable
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        _pointerSettingsWindow.title = @"Magic Mouse 포인터 정밀도";
+        _pointerSettingsWindow.releasedWhenClosed = NO;
+
+        NSTextField *heading = [NSTextField labelWithString:
+            @"Magic Mouse 이동 속도 곡선"];
+        heading.font = [NSFont boldSystemFontOfSize:16.0];
+        NSTextField *description = [NSTextField wrappingLabelWithString:
+            @"작은 움직임은 정밀하게, 빠른 움직임은 넓은 화면을 빠르게 이동하도록 각 구간의 속도를 조절합니다. 트랙패드에는 적용되지 않습니다."];
+        description.textColor = NSColor.secondaryLabelColor;
+
+        _pointerPrecisionCheckbox = [NSButton
+            checkboxWithTitle:@"Magic Mouse 포인터 정밀도 사용"
+                       target:self
+                       action:@selector(updatePointerPrecisionEnabled:)];
+
+        _pointerFineSlider = [NSSlider
+            sliderWithValue:_detector.pointerFineGain
+                   minValue:0.0
+                   maxValue:1.0
+                     target:self
+                     action:@selector(updatePointerGain:)];
+        _pointerMediumSlider = [NSSlider
+            sliderWithValue:_detector.pointerMediumGain
+                   minValue:0.25
+                   maxValue:1.50
+                     target:self
+                     action:@selector(updatePointerGain:)];
+        _pointerFastSlider = [NSSlider
+            sliderWithValue:_detector.pointerFastGain
+                   minValue:0.25
+                   maxValue:1.50
+                     target:self
+                     action:@selector(updatePointerGain:)];
+        _pointerFineSlider.tag = 0;
+        _pointerMediumSlider.tag = 1;
+        _pointerFastSlider.tag = 2;
+        _pointerFineSlider.continuous = YES;
+        _pointerMediumSlider.continuous = YES;
+        _pointerFastSlider.continuous = YES;
+        [_pointerFineSlider.widthAnchor constraintEqualToConstant:260.0].active = YES;
+        [_pointerMediumSlider.widthAnchor constraintEqualToConstant:260.0].active = YES;
+        [_pointerFastSlider.widthAnchor constraintEqualToConstant:260.0].active = YES;
+
+        _pointerFineValueLabel = [NSTextField labelWithString:@""];
+        _pointerMediumValueLabel = [NSTextField labelWithString:@""];
+        _pointerFastValueLabel = [NSTextField labelWithString:@""];
+
+        NSButton *resetButton = [NSButton buttonWithTitle:@"기본값으로 복원"
+                                                   target:self
+                                                   action:@selector(resetPointerGains:)];
+        resetButton.bezelStyle = NSBezelStyleRounded;
+
+        NSStackView *stack = [NSStackView stackViewWithViews:@[
+            heading,
+            description,
+            _pointerPrecisionCheckbox,
+            [self pointerSliderRowWithTitle:@"미세 이동"
+                                      slider:_pointerFineSlider
+                                  valueLabel:_pointerFineValueLabel],
+            [self pointerSliderRowWithTitle:@"중간 속도"
+                                      slider:_pointerMediumSlider
+                                  valueLabel:_pointerMediumValueLabel],
+            [self pointerSliderRowWithTitle:@"빠른 이동"
+                                      slider:_pointerFastSlider
+                                  valueLabel:_pointerFastValueLabel],
+            resetButton
+        ]];
+        stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+        stack.alignment = NSLayoutAttributeLeading;
+        stack.spacing = 16.0;
+        stack.translatesAutoresizingMaskIntoConstraints = NO;
+
+        NSView *content = _pointerSettingsWindow.contentView;
+        [content addSubview:stack];
+        [NSLayoutConstraint activateConstraints:@[
+            [stack.leadingAnchor constraintEqualToAnchor:content.leadingAnchor
+                                                constant:24.0],
+            [stack.trailingAnchor constraintEqualToAnchor:content.trailingAnchor
+                                                 constant:-24.0],
+            [stack.topAnchor constraintEqualToAnchor:content.topAnchor
+                                             constant:22.0]
+        ]];
+    }
+
+    [self refreshPointerSettingsControls];
+    [_pointerSettingsWindow center];
+    [_pointerSettingsWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)refreshPointerSettingsControls {
+    _pointerPrecisionCheckbox.state = _detector.pointerPrecisionEnabled
+        ? NSControlStateValueOn
+        : NSControlStateValueOff;
+    _pointerFineSlider.doubleValue = _detector.pointerFineGain;
+    _pointerMediumSlider.doubleValue = _detector.pointerMediumGain;
+    _pointerFastSlider.doubleValue = _detector.pointerFastGain;
+    _pointerFineValueLabel.stringValue = [NSString stringWithFormat:@"%.0f%%",
+                                           _detector.pointerFineGain * 100.0];
+    _pointerMediumValueLabel.stringValue = [NSString stringWithFormat:@"%.0f%%",
+                                             _detector.pointerMediumGain * 100.0];
+    _pointerFastValueLabel.stringValue = [NSString stringWithFormat:@"%.0f%%",
+                                           _detector.pointerFastGain * 100.0];
+    BOOL enabled = _detector.pointerPrecisionEnabled;
+    _pointerFineSlider.enabled = enabled;
+    _pointerMediumSlider.enabled = enabled;
+    _pointerFastSlider.enabled = enabled;
+}
+
+- (void)updatePointerPrecisionEnabled:(id)sender {
+    NSButton *checkbox = (NSButton *)sender;
+    _detector.pointerPrecisionEnabled =
+        checkbox.state == NSControlStateValueOn;
+    [self refreshPointerSettingsControls];
+    [self refreshMenu];
+}
+
+- (void)updatePointerGain:(id)sender {
+    NSSlider *slider = (NSSlider *)sender;
+    if (slider.tag == 0) {
+        _detector.pointerFineGain = slider.doubleValue;
+    } else if (slider.tag == 1) {
+        _detector.pointerMediumGain = slider.doubleValue;
+    } else {
+        _detector.pointerFastGain = slider.doubleValue;
+    }
+    [self refreshPointerSettingsControls];
+}
+
+
+- (void)resetPointerGains:(id)sender {
+    (void)sender;
+    _detector.pointerPrecisionEnabled = NO;
+    _detector.pointerFineGain = kDefaultPointerFineGain;
+    _detector.pointerMediumGain = kDefaultPointerMediumGain;
+    _detector.pointerFastGain = kDefaultPointerFastGain;
+    [self refreshPointerSettingsControls];
+    [self refreshMenu];
+}
 - (void)openAccessibilitySettings:(id)sender {
     (void)sender;
     NSString *privacyAnchor = InputMonitoringIsGranted()
@@ -1603,6 +2187,28 @@ static int RunSelfTest(void) {
         ClickModeAllowsTouch(ClickActivationModeTouchAndPhysical) &&
         ClickModeAllowsPhysicalClick(ClickActivationModeTouchAndPhysical);
     printf("click mode matrix: %s\n", clickModeMatrixOK ? "OK" : "FAIL");
+    double fineResult = PointerGainForRawSpeed(1.0,
+                                               kDefaultPointerFineGain,
+                                               kDefaultPointerMediumGain,
+                                               kDefaultPointerFastGain);
+    double mediumResult = PointerGainForRawSpeed(32.0,
+                                                 kDefaultPointerFineGain,
+                                                 kDefaultPointerMediumGain,
+                                                 kDefaultPointerFastGain);
+    double fastResult = PointerGainForRawSpeed(97.0,
+                                               kDefaultPointerFineGain,
+                                               kDefaultPointerMediumGain,
+                                               kDefaultPointerFastGain);
+    BOOL pointerCurveOK = fabs(fineResult - kDefaultPointerFineGain) < 0.001 &&
+                          fabs(mediumResult - kDefaultPointerMediumGain) < 0.001 &&
+                          fabs(fastResult - kDefaultPointerFastGain) < 0.001 &&
+                          fineResult <= mediumResult &&
+                          mediumResult <= fastResult;
+    printf("pointer precision curve: %s (fine=%.2f medium=%.2f fast=%.2f)\n",
+           pointerCurveOK ? "OK" : "FAIL",
+           fineResult,
+           mediumResult,
+           fastResult);
     printf("caller-context accessibility: %s\n",
            AXIsProcessTrusted() ? "granted" : "not granted");
     printf("caller-context post event access: %s\n",
@@ -1622,13 +2228,18 @@ static int RunSelfTest(void) {
         CFRelease(eventTap);
     }
     dlclose(framework);
-    return clickModeMatrixOK && eventTap != NULL ? 0 : 1;
+    return clickModeMatrixOK && pointerCurveOK && eventTap != NULL ? 0 : 1;
 }
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
             return RunSelfTest();
+        }
+
+        if (!AcquireSingleInstanceLock()) {
+            NSLog(@"MagicTapClick: another instance is already running; exiting");
+            return 0;
         }
 
         NSApplication *application = [NSApplication sharedApplication];
