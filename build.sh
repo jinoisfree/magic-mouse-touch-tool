@@ -98,10 +98,15 @@ mkdir -p "$(dirname "$INSTALL_APP_DIR")"
 xattr -cr "$INSTALL_APP_DIR"
 codesign --verify --deep --strict "$INSTALL_APP_DIR"
 
-SERVICE_TARGET="gui/$(/usr/bin/id -u)/com.jino.magic-tap-click"
-if /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
-    /bin/launchctl kickstart -k "$SERVICE_TARGET"
-    echo "Restarted: $SERVICE_TARGET"
+SERVICE_DOMAIN="gui/$(/usr/bin/id -u)"
+SERVICE_TARGET="$SERVICE_DOMAIN/com.jino.magic-tap-click"
+LAUNCH_AGENT_PLIST="/Users/jinoisfree/Library/LaunchAgents/com.jino.magic-tap-click.plist"
+if [[ -f "$LAUNCH_AGENT_PLIST" ]]; then
+    if /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
+        /bin/launchctl bootout "$SERVICE_TARGET"
+    fi
+    /bin/launchctl bootstrap "$SERVICE_DOMAIN" "$LAUNCH_AGENT_PLIST"
+    echo "Reloaded: $SERVICE_TARGET"
 fi
 
 echo "Built: $APP_DIR"

@@ -1484,6 +1484,7 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
     NSMenuItem *_permissionItem;
     NSTimer *_permissionTimer;
     BOOL _engineRunning;
+    BOOL _wakeRefreshScheduled;
     NSTimeInterval _nextEngineRetryTime;
     NSString *_lastRuntimeFingerprint;
     NSWindow *_pointerSettingsWindow;
@@ -1514,6 +1515,7 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
 - (void)requestMissingPermissions;
 - (void)reconcileRuntimeState;
 - (void)permissionTimerFired:(NSTimer *)timer;
+- (void)handleSystemWake:(NSNotification *)notification;
 - (void)restartForPermissionRefresh:(id)sender;
 @end
 
@@ -1524,6 +1526,11 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
     _detector = [TapDetector new];
+    [[[NSWorkspace sharedWorkspace] notificationCenter]
+        addObserver:self
+           selector:@selector(handleSystemWake:)
+               name:NSWorkspaceDidWakeNotification
+             object:nil];
     NSLog(@"MagicTapClick: click modes left=%@ right=%@",
           ClickActivationModeTitle(_detector.leftClickMode),
           ClickActivationModeTitle(_detector.rightClickMode));
@@ -1577,6 +1584,27 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
 - (void)permissionTimerFired:(NSTimer *)timer {
     (void)timer;
     [self reconcileRuntimeState];
+}
+
+- (void)handleSystemWake:(NSNotification *)notification {
+    (void)notification;
+    if (_wakeRefreshScheduled) {
+        return;
+    }
+    _wakeRefreshScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        self->_wakeRefreshScheduled = NO;
+        if (self->_engineRunning) {
+            [self->_detector stop];
+            self->_engineRunning = NO;
+        }
+        self->_nextEngineRetryTime = 0.0;
+        self->_lastRuntimeFingerprint = nil;
+        NSLog(@"MagicTapClick: refreshing input engine after system wake");
+        [self reconcileRuntimeState];
+    });
 }
 
 - (void)reconcileRuntimeState {
@@ -2012,6 +2040,7 @@ static void PostLeftMouseButtonEvent(CGEventType type) {
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
+    [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
     [_permissionTimer invalidate];
     _permissionTimer = nil;
     [_detector stop];
